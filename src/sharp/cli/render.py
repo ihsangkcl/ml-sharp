@@ -35,14 +35,18 @@ LOGGER = logging.getLogger(__name__)
     help="Path to save the rendered videos.",
     required=True,
 )
+@click.option(
+    "--device",
+    type=str,
+    default="default",
+    help="Device to run on. ['cpu', 'mps', 'cuda']. gsplat's rasterizer is CUDA-only in most builds; MPS/CPU may fail at render time.",
+)
 @click.option("-v", "--verbose", is_flag=True, help="Activate debug logs.")
-def render_cli(input_path: Path, output_path: Path, verbose: bool):
+def render_cli(input_path: Path, output_path: Path, device: str, verbose: bool):
     """Predict Gaussians from input images."""
     logging_utils.configure(logging.DEBUG if verbose else logging.INFO)
 
-    if not torch.cuda.is_available():
-        LOGGER.error("Rendering a checkpoint requires CUDA.")
-        exit(1)
+    device = _resolve_render_device(device)
 
     output_path.mkdir(exist_ok=True, parents=True)
 
@@ -64,7 +68,29 @@ def render_cli(input_path: Path, output_path: Path, verbose: bool):
             metadata=metadata,
             params=params,
             output_path=(output_path / scene_path.stem).with_suffix(".mp4"),
+            device=device,
         )
+
+
+def _resolve_render_device(device: str) -> torch.device:
+    """Pick a render device, warning when gsplat is unlikely to support it."""
+    if device == "default":
+        if torch.cuda.is_available():
+            resolved = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            resolved = torch.device("mps")
+        else:
+            resolved = torch.device("cpu")
+    else:
+        resolved = torch.device(device)
+
+    if resolved.type != "cuda":
+        LOGGER.warning(
+            "Rendering on '%s'. gsplat's rasterizer is CUDA-only in most prebuilt wheels; "
+            "this may fail at render time.",
+            resolved.type,
+        )
+    return resolved
 
 
 def render_gaussians(
@@ -72,6 +98,7 @@ def render_gaussians(
     metadata: SceneMetaData,
     output_path: Path,
     params: camera.TrajectoryParams | None = None,
+    device: torch.device | str = "default",
 ) -> None:
     """Render a single gaussian checkpoint file."""
     (width, height) = metadata.resolution_px
@@ -80,10 +107,8 @@ def render_gaussians(
     if params is None:
         params = camera.TrajectoryParams()
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("Rendering a checkpoint requires CUDA.")
-
-    device = torch.device("cuda")
+    if not isinstance(device, torch.device):
+        device = _resolve_render_device(device)
 
     intrinsics = torch.tensor(
         [
@@ -118,3 +143,41 @@ def render_gaussians(
         depth = rendering_output.depth[0]
         video_writer.add_frame(color, depth)
     video_writer.close()
+
+
+def render_input_view(
+    gaussians: Gaussians3D,
+    metadata: SceneMetaData,
+    device: torch.device | str = "default",
+) -> torch.Tensor:
+    """Render gaussians at the input camera pose (identity extrinsics).
+
+    Returns a (3, H, W) float tensor in [0, 1], in the input image's sRGB space.
+    """
+    if not isinstance(device, torch.device):
+        device = _resolve_render_device(device)
+
+    width, height = metadata.resolution_px
+    f_px = metadata.focal_length_px
+
+    intrinsics = torch.tensor(
+        [
+            [f_px, 0, (width - 1) / 2.0, 0],
+            [0, f_px, (height - 1) / 2.0, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
+        ],
+        device=device,
+        dtype=torch.float32,
+    )
+    extrinsics = torch.eye(4, device=device, dtype=torch.float32)
+
+    renderer = gsplat.GSplatRenderer(color_space=metadata.color_space)
+    output = renderer(
+        gaussians.to(device),
+        extrinsics=extrinsics[None],
+        intrinsics=intrinsics[None],
+        image_width=width,
+        image_height=height,
+    )
+    return output.color[0].clamp(0.0, 1.0)

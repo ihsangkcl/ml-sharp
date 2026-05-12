@@ -164,3 +164,8 @@ cython_debug/
 .DS_STORE
 *.pt
 .aider*
+
+# Local data — do not commit
+input/
+output/
+output_test/

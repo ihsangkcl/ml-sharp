@@ -6,6 +6,7 @@ Copyright (C) 2025 Apple Inc. All Rights Reserved.
 
 from __future__ import annotations
 
+import csv
 import logging
 from pathlib import Path
 
@@ -28,8 +29,9 @@ from sharp.utils.gaussians import (
     save_ply,
     unproject_gaussians,
 )
+from sharp.utils.metrics import compute_all as compute_metrics
 
-from .render import render_gaussians
+from .render import render_gaussians, render_input_view
 
 LOGGER = logging.getLogger(__name__)
 
@@ -67,6 +69,13 @@ DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh
     help="Whether to render trajectory for checkpoint.",
 )
 @click.option(
+    "--metrics/--no-metrics",
+    "with_metrics",
+    is_flag=True,
+    default=False,
+    help="Render a novel view from the input pose and compute PSNR/SSIM/LPIPS/DISTS against the input image. Uses --device for rendering; gsplat's rasterizer is CUDA-only in most prebuilt wheels and may fail on MPS/CPU.",
+)
+@click.option(
     "--device",
     type=str,
     default="default",
@@ -78,6 +87,7 @@ def predict_cli(
     output_path: Path,
     checkpoint_path: Path,
     with_rendering: bool,
+    with_metrics: bool,
     device: str,
     verbose: bool,
 ):
@@ -109,9 +119,12 @@ def predict_cli(
             device = "cpu"
     LOGGER.info("Using device %s", device)
 
-    if with_rendering and device != "cuda":
-        LOGGER.warning("Can only run rendering with gsplat on CUDA. Rendering is disabled.")
-        with_rendering = False
+    if (with_rendering or with_metrics) and device != "cuda":
+        LOGGER.warning(
+            "Rendering on '%s'. gsplat's rasterizer is CUDA-only in most prebuilt wheels; "
+            "render/metrics may fail at the rasterization step.",
+            device,
+        )
 
     # Load or download checkpoint
     if checkpoint_path is None:
@@ -127,6 +140,8 @@ def predict_cli(
     gaussian_predictor.to(device)
 
     output_path.mkdir(exist_ok=True, parents=True)
+
+    metrics_rows: list[dict[str, float | str]] = []
 
     for image_path in image_paths:
         LOGGER.info("Processing %s", image_path)
@@ -147,12 +162,74 @@ def predict_cli(
         LOGGER.info("Saving 3DGS to %s", output_path)
         save_ply(gaussians, f_px, (height, width), output_path / f"{image_path.stem}.ply")
 
+        metadata = None
         if with_rendering:
             output_video_path = (output_path / image_path.stem).with_suffix(".mp4")
             LOGGER.info("Rendering trajectory to %s", output_video_path)
 
             metadata = SceneMetaData(intrinsics[0, 0].item(), (width, height), "linearRGB")
-            render_gaussians(gaussians, metadata, output_video_path)
+            render_gaussians(gaussians, metadata, output_video_path, device=torch.device(device))
+
+        if with_metrics:
+            if metadata is None:
+                metadata = SceneMetaData(intrinsics[0, 0].item(), (width, height), "linearRGB")
+
+            LOGGER.info("Rendering novel view at input pose and computing metrics.")
+            rendered = render_input_view(
+                gaussians, metadata, device=torch.device(device)
+            )  # (3, H, W) in [0, 1]
+
+            gt = (
+                torch.from_numpy(image.copy()).float().permute(2, 0, 1) / 255.0
+            ).to(rendered.device)
+
+            metrics = compute_metrics(rendered, gt)
+            LOGGER.info(
+                "%s metrics: psnr=%.3f ssim=%.4f lpips=%.4f dists=%.4f",
+                image_path.name,
+                metrics["psnr"],
+                metrics["ssim"],
+                metrics["lpips"],
+                metrics["dists"],
+            )
+
+            rendered_np = (rendered.permute(1, 2, 0).cpu().numpy() * 255.0).clip(0, 255).astype(
+                np.uint8
+            )
+            gt_np = (gt.permute(1, 2, 0).cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+            io.save_image(rendered_np, output_path / f"{image_path.stem}_render.png")
+            io.save_image(gt_np, output_path / f"{image_path.stem}_gt.png")
+            io.save_image(
+                np.concatenate([gt_np, rendered_np], axis=1),
+                output_path / f"{image_path.stem}_compare.png",
+            )
+
+            metrics_rows.append({"image": image_path.name, **metrics})
+
+    if with_metrics and metrics_rows:
+        csv_path = output_path / "metrics.csv"
+        fieldnames = ["image", "psnr", "ssim", "lpips", "dists"]
+        with csv_path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in metrics_rows:
+                writer.writerow(row)
+            mean_row = {
+                "image": "mean",
+                **{
+                    k: float(np.mean([r[k] for r in metrics_rows]))  # type: ignore[arg-type]
+                    for k in fieldnames[1:]
+                },
+            }
+            writer.writerow(mean_row)
+        LOGGER.info(
+            "Wrote metrics to %s (mean: psnr=%.3f ssim=%.4f lpips=%.4f dists=%.4f).",
+            csv_path,
+            mean_row["psnr"],
+            mean_row["ssim"],
+            mean_row["lpips"],
+            mean_row["dists"],
+        )
 
 
 @torch.no_grad()

@@ -5,8 +5,10 @@ description = "Inference/Network/Model code for SHARP view synthesis model."
 readme = "README.md"
 dependencies = [
   "click",
+  "DISTS-pytorch",
   "gsplat",
   "imageio[ffmpeg]",
+  "lpips",
   "matplotlib",
   "pillow-heif",
   "plyfile",

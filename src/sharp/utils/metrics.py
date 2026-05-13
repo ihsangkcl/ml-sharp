@@ -94,8 +94,55 @@ def lpips_score(pred: torch.Tensor, target: torch.Tensor, net: str = "vgg") -> f
     return model(pred * 2.0 - 1.0, target * 2.0 - 1.0).mean().item()
 
 
+def _ensure_dists_weights() -> None:
+    """Work around DISTS-pytorch's hardcoded `sys.prefix/weights.pt` path.
+
+    The pip wheel bundles `weights.pt` but installs it inconsistently
+    (sometimes in the package dir, sometimes via `data_files` to sys.prefix).
+    DISTS's __init__ always loads from `sys.prefix/weights.pt`, so if it lives
+    elsewhere the constructor crashes with FileNotFoundError. We locate the
+    file in known locations and place a symlink (falling back to a copy) at
+    the expected path.
+    """
+    import os  # noqa: PLC0415
+    import shutil  # noqa: PLC0415
+    import sys  # noqa: PLC0415
+
+    target = os.path.join(sys.prefix, "weights.pt")
+    if os.path.exists(target):
+        return
+
+    candidates: list[str] = []
+    try:
+        import DISTS_pytorch as _dp  # noqa: PLC0415
+
+        pkg_dir = os.path.dirname(_dp.__file__)
+        candidates.append(os.path.join(pkg_dir, "weights.pt"))
+        candidates.append(os.path.join(os.path.dirname(pkg_dir), "weights.pt"))
+    except ImportError:
+        pass
+    candidates.append(os.path.join(sys.exec_prefix, "weights.pt"))
+
+    source = next((c for c in candidates if os.path.exists(c)), None)
+    if source is None:
+        raise FileNotFoundError(
+            "DISTS-pytorch's weights.pt was not found in any expected location "
+            f"(checked: {candidates + [target]}). "
+            "Locate it via `find / -name weights.pt` and copy to "
+            f"{target}, or run: "
+            "wget https://github.com/dingkeyan93/DISTS/raw/master/DISTS_pytorch/weights.pt "
+            f"-O {target}"
+        )
+
+    try:
+        os.symlink(source, target)
+    except OSError:
+        shutil.copy(source, target)
+
+
 @functools.lru_cache(maxsize=2)
 def _get_dists_model(device: str):
+    _ensure_dists_weights()
     from DISTS_pytorch import DISTS  # noqa: PLC0415
 
     model = DISTS().to(device)

@@ -123,6 +123,16 @@ def _resolve_device(device: str) -> str:
     help="Multiply both render and GT by H3DS foreground masks before computing metrics.",
 )
 @click.option(
+    "--world-scale",
+    default=1.0,
+    type=float,
+    help=(
+        "Multiplier applied to H3DS pose translations. SHARP predicts gaussians in metric "
+        "meters; if H3DS poses are in different units (e.g. millimeters), set this to convert "
+        "(0.001 for mm -> m). Use the pose-diagnostics logged at INFO to check |t| magnitudes."
+    ),
+)
+@click.option(
     "-o",
     "--output-path",
     required=True,
@@ -157,6 +167,7 @@ def eval_h3ds_cli(
     views_config: str,
     max_side: int,
     apply_mask: bool,
+    world_scale: float,
     output_path: Path,
     checkpoint_path: Path | None,
     save_gaussians: bool,
@@ -255,7 +266,8 @@ def eval_h3ds_cli(
         input_np = np.array(images_pil[0])
         K0, pose0 = cameras[0]
         K0 = np.asarray(K0, dtype=np.float32)
-        pose0 = np.asarray(pose0, dtype=np.float32)
+        pose0 = np.asarray(pose0, dtype=np.float32).copy()
+        pose0[:3, 3] *= world_scale
         input_np, K0_resized = _resize_with_intrinsics(input_np, K0, max_side)
         h_in, w_in = input_np.shape[:2]
         f_px = float((K0_resized[0, 0] + K0_resized[1, 1]) / 2.0)
@@ -269,12 +281,66 @@ def eval_h3ds_cli(
         if save_gaussians:
             save_ply(gaussians, f_px, (h_in, w_in), scene_dir / f"{scene_id}.ply")
 
+        # --- Sanity render at view 0 (identity extrinsics). If this is also
+        # black, gaussians themselves are bad; if it matches the input, the
+        # problem is the GT-pose transform / scale.
+        K0_3x3 = torch.from_numpy(K0_resized[:3, :3].astype(np.float32))
+        try:
+            self_rendered = render_at_pose(
+                gaussians=gaussians,
+                extrinsics=torch.eye(4, dtype=torch.float32),
+                intrinsics_3x3=K0_3x3,
+                image_height=h_in,
+                image_width=w_in,
+                color_space="linearRGB",
+                device=device_pt,
+            )
+            self_rendered_np = (
+                (self_rendered.permute(1, 2, 0).cpu().numpy() * 255.0)
+                .clip(0, 255)
+                .astype(np.uint8)
+            )
+            io.save_image(self_rendered_np, scene_dir / "view_00_self_render.png")
+            io.save_image(
+                np.concatenate([input_np, self_rendered_np], axis=1),
+                scene_dir / "view_00_self_compare.png",
+            )
+            self_mean = float(self_rendered.mean().item())
+            LOGGER.info(
+                "Sanity render at view 0: mean pixel value = %.4f (should be > 0 if "
+                "gaussians are visible at the input pose).",
+                self_mean,
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.error("Self-render at view 0 failed: %s", exc)
+
+        # Pose diagnostics for the GT views.
+        for diag_idx in range(1, len(images_pil)):
+            _, pose_diag = cameras[diag_idx]
+            pose_diag = np.asarray(pose_diag, dtype=np.float32).copy()
+            pose_diag[:3, 3] *= world_scale
+            rel = np.linalg.inv(pose_diag) @ pose0
+            t = rel[:3, 3]
+            # rotation angle from trace
+            cos_a = (np.trace(rel[:3, :3]) - 1.0) / 2.0
+            angle_deg = float(np.degrees(np.arccos(np.clip(cos_a, -1.0, 1.0))))
+            LOGGER.info(
+                "  pose[0->%d]: |t|=%.3f units, rot=%.1f deg, t=[%.3f, %.3f, %.3f]",
+                diag_idx,
+                float(np.linalg.norm(t)),
+                angle_deg,
+                t[0],
+                t[1],
+                t[2],
+            )
+
         for gt_idx in range(1, len(images_pil)):
             gt_image_pil = images_pil[gt_idx]
             gt_mask_pil = masks_pil[gt_idx]
             K_gt, pose_gt = cameras[gt_idx]
             K_gt = np.asarray(K_gt, dtype=np.float32)
-            pose_gt = np.asarray(pose_gt, dtype=np.float32)
+            pose_gt = np.asarray(pose_gt, dtype=np.float32).copy()
+            pose_gt[:3, 3] *= world_scale
 
             gt_np = np.array(gt_image_pil)
             gt_np, K_gt_resized = _resize_with_intrinsics(gt_np, K_gt, max_side)

@@ -357,7 +357,9 @@ def eval_h3ds_cli(
                 self_metrics["lpips"],
                 self_metrics["dists"],
             )
-            rows.append({"scene": scene_id, "view": 0, **self_metrics})
+            rows.append(
+                {"scene": scene_id, "view": 0, "angle": 0.0, **self_metrics}
+            )
         except Exception as exc:  # noqa: BLE001
             LOGGER.error("Self-render at view 0 failed: %s", exc)
 
@@ -483,14 +485,17 @@ def eval_h3ds_cli(
                 scene_dir / f"view_{gt_idx:02d}_compare.png",
             )
 
-            rows.append({"scene": scene_id, "view": gt_idx, **metrics})
+            rows.append(
+                {"scene": scene_id, "view": gt_idx, "angle": gt_angle, **metrics}
+            )
 
     if not rows:
         LOGGER.error("No metrics computed. Check scene IDs / views-config / dataset state.")
         return
 
     csv_path = output_path / "metrics.csv"
-    fieldnames = ["scene", "view", "psnr", "ssim", "lpips", "dists"]
+    fieldnames = ["scene", "view", "angle", "psnr", "ssim", "lpips", "dists"]
+    metric_fields = ["psnr", "ssim", "lpips", "dists"]
     with csv_path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -499,7 +504,8 @@ def eval_h3ds_cli(
         mean_row = {
             "scene": "MEAN",
             "view": "-",
-            **{k: float(np.mean([r[k] for r in rows])) for k in fieldnames[2:]},
+            "angle": "-",
+            **{k: float(np.mean([r[k] for r in rows])) for k in metric_fields},
         }
         writer.writerow(mean_row)
     LOGGER.info(

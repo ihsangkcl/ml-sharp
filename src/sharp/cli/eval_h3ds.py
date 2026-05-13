@@ -23,11 +23,11 @@ from PIL import Image
 from sharp.models import PredictorParams, create_predictor
 from sharp.utils import io
 from sharp.utils import logging as logging_utils
-from sharp.utils.gaussians import save_ply
+from sharp.utils.gaussians import SceneMetaData, save_ply
 from sharp.utils.metrics import compute_all as compute_metrics
 
 from .predict import DEFAULT_MODEL_URL, predict_image
-from .render import render_at_pose
+from .render import render_at_pose, render_gaussians
 
 LOGGER = logging.getLogger(__name__)
 
@@ -104,11 +104,27 @@ def _resolve_device(device: str) -> str:
 )
 @click.option(
     "--views-config",
-    default="3",
+    default=None,
     help=(
-        "H3DS view-config id (e.g. '3', '4', '6'). Selects a precomputed subset of views. "
-        "Index 0 is the input view; the rest are GT novel views."
+        "H3DS view-config id (e.g. '3', '4', '6', '32'). Selects a precomputed subset of views. "
+        "Index 0 is the input view; the rest are candidate GT views. "
+        "If omitted, all views are loaded and filtered by --max-angle."
     ),
+)
+@click.option(
+    "--max-angle",
+    default=30.0,
+    type=float,
+    help=(
+        "Maximum rotation (degrees) between view 0 and a candidate GT view. "
+        "Larger baselines look bad for a monocular predictor, so we filter them out."
+    ),
+)
+@click.option(
+    "--max-gt-views",
+    default=5,
+    type=int,
+    help="Cap the number of GT views per scene (after --max-angle filtering).",
 )
 @click.option(
     "--max-side",
@@ -153,6 +169,12 @@ def _resolve_device(device: str) -> str:
     help="Also save the predicted gaussians for each scene as .ply.",
 )
 @click.option(
+    "--render-video/--no-render-video",
+    "render_video",
+    default=False,
+    help="Also write the SHARP trajectory mp4 (color + depth) per scene, like `sharp predict --render`.",
+)
+@click.option(
     "--device",
     default="default",
     help="Device to run on. ['cpu', 'mps', 'cuda']. gsplat needs CUDA.",
@@ -164,13 +186,16 @@ def eval_h3ds_cli(
     config_id: str,
     scene_ids: str | None,
     num_scenes: int,
-    views_config: str,
+    views_config: str | None,
+    max_angle: float,
+    max_gt_views: int,
     max_side: int,
     apply_mask: bool,
     world_scale: float,
     output_path: Path,
     checkpoint_path: Path | None,
     save_gaussians: bool,
+    render_video: bool,
     device: str,
     verbose: bool,
 ):
@@ -231,16 +256,19 @@ def eval_h3ds_cli(
     for scene_id in scenes_to_eval:
         LOGGER.info("==== scene %s ====", scene_id)
 
-        available_configs = [str(c) for c in h3ds.default_views_configs(scene_id)]
-        chosen_config = str(views_config)
-        if chosen_config not in available_configs:
-            LOGGER.warning(
-                "Scene %s has no views-config '%s'. Available: %s. Skipping.",
-                scene_id,
-                chosen_config,
-                available_configs,
-            )
-            continue
+        if views_config is not None:
+            available_configs = [str(c) for c in h3ds.default_views_configs(scene_id)]
+            chosen_config: str | None = str(views_config)
+            if chosen_config not in available_configs:
+                LOGGER.warning(
+                    "Scene %s has no views-config '%s'. Available: %s. Skipping.",
+                    scene_id,
+                    chosen_config,
+                    available_configs,
+                )
+                continue
+        else:
+            chosen_config = None  # load all views
 
         try:
             _, images_pil, masks_pil, cameras = h3ds.load_scene(
@@ -281,9 +309,9 @@ def eval_h3ds_cli(
         if save_gaussians:
             save_ply(gaussians, f_px, (h_in, w_in), scene_dir / f"{scene_id}.ply")
 
-        # --- Sanity render at view 0 (identity extrinsics). If this is also
-        # black, gaussians themselves are bad; if it matches the input, the
-        # problem is the GT-pose transform / scale.
+        # --- Self-render at view 0 (identity extrinsics). Sanity check + metrics
+        # for input-view reconstruction. Mask via view-0 mask so we evaluate on
+        # the face region only.
         K0_3x3 = torch.from_numpy(K0_resized[:3, :3].astype(np.float32))
         try:
             self_rendered = render_at_pose(
@@ -305,36 +333,87 @@ def eval_h3ds_cli(
                 np.concatenate([input_np, self_rendered_np], axis=1),
                 scene_dir / "view_00_self_compare.png",
             )
-            self_mean = float(self_rendered.mean().item())
+
+            input_t = (
+                torch.from_numpy(input_np.copy()).float().permute(2, 0, 1) / 255.0
+            ).to(self_rendered.device)
+            if apply_mask:
+                mask_bool_self = _resize_mask_to(masks_pil[0], w_in, h_in)
+                mask_t_self = (
+                    torch.from_numpy(mask_bool_self).to(self_rendered.device)[None].float()
+                )
+                rendered_for_metrics_self = self_rendered * mask_t_self
+                gt_for_metrics_self = input_t * mask_t_self
+            else:
+                rendered_for_metrics_self = self_rendered
+                gt_for_metrics_self = input_t
+
+            self_metrics = compute_metrics(rendered_for_metrics_self, gt_for_metrics_self)
             LOGGER.info(
-                "Sanity render at view 0: mean pixel value = %.4f (should be > 0 if "
-                "gaussians are visible at the input pose).",
-                self_mean,
+                "scene=%s view=0 (self) psnr=%.2f ssim=%.4f lpips=%.4f dists=%.4f",
+                scene_id,
+                self_metrics["psnr"],
+                self_metrics["ssim"],
+                self_metrics["lpips"],
+                self_metrics["dists"],
             )
+            rows.append({"scene": scene_id, "view": 0, **self_metrics})
         except Exception as exc:  # noqa: BLE001
             LOGGER.error("Self-render at view 0 failed: %s", exc)
 
-        # Pose diagnostics for the GT views.
-        for diag_idx in range(1, len(images_pil)):
-            _, pose_diag = cameras[diag_idx]
-            pose_diag = np.asarray(pose_diag, dtype=np.float32).copy()
-            pose_diag[:3, 3] *= world_scale
-            rel = np.linalg.inv(pose_diag) @ pose0
+        # --- Optional SHARP trajectory mp4 (color + depth).
+        if render_video:
+            try:
+                metadata = SceneMetaData(f_px, (w_in, h_in), "linearRGB")
+                render_gaussians(
+                    gaussians, metadata, scene_dir / "trajectory.mp4", device=device_pt
+                )
+                LOGGER.info("Wrote trajectory video to %s/trajectory.mp4", scene_dir)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.error("Trajectory render failed for %s: %s", scene_id, exc)
+
+        # --- Filter GT views: compute relative pose for each candidate,
+        # keep those within --max-angle, sort by angle, cap at --max-gt-views.
+        candidate_views: list[tuple[int, float, float]] = []  # (idx, angle_deg, |t|)
+        for cand_idx in range(1, len(images_pil)):
+            _, pose_cand = cameras[cand_idx]
+            pose_cand = np.asarray(pose_cand, dtype=np.float32).copy()
+            pose_cand[:3, 3] *= world_scale
+            rel = np.linalg.inv(pose_cand) @ pose0
             t = rel[:3, 3]
-            # rotation angle from trace
             cos_a = (np.trace(rel[:3, :3]) - 1.0) / 2.0
             angle_deg = float(np.degrees(np.arccos(np.clip(cos_a, -1.0, 1.0))))
+            candidate_views.append((cand_idx, angle_deg, float(np.linalg.norm(t))))
+
+        # Log all candidates (full diagnostic), then filter.
+        for cand_idx, angle_deg, t_norm in candidate_views:
             LOGGER.info(
-                "  pose[0->%d]: |t|=%.3f units, rot=%.1f deg, t=[%.3f, %.3f, %.3f]",
-                diag_idx,
-                float(np.linalg.norm(t)),
+                "  pose[0->%d]: rot=%.1f deg, |t|=%.3f",
+                cand_idx,
                 angle_deg,
-                t[0],
-                t[1],
-                t[2],
+                t_norm,
+            )
+        kept = sorted(
+            (c for c in candidate_views if c[1] <= max_angle), key=lambda c: c[1]
+        )[: max(0, max_gt_views)]
+        if not kept:
+            LOGGER.warning(
+                "Scene %s: no GT views within --max-angle=%.1f deg "
+                "(closest was %.1f deg). Try a larger threshold or wider --views-config.",
+                scene_id,
+                max_angle,
+                min((c[1] for c in candidate_views), default=float("nan")),
+            )
+        else:
+            LOGGER.info(
+                "Scene %s: evaluating %d GT view(s) within %.1f deg: %s",
+                scene_id,
+                len(kept),
+                max_angle,
+                [(idx, round(ang, 1)) for idx, ang, _ in kept],
             )
 
-        for gt_idx in range(1, len(images_pil)):
+        for gt_idx, gt_angle, _ in kept:
             gt_image_pil = images_pil[gt_idx]
             gt_mask_pil = masks_pil[gt_idx]
             K_gt, pose_gt = cameras[gt_idx]
@@ -382,9 +461,10 @@ def eval_h3ds_cli(
 
             metrics = compute_metrics(rendered_for_metrics, gt_for_metrics)
             LOGGER.info(
-                "scene=%s view=%d psnr=%.2f ssim=%.4f lpips=%.4f dists=%.4f",
+                "scene=%s view=%d (%.1f deg) psnr=%.2f ssim=%.4f lpips=%.4f dists=%.4f",
                 scene_id,
                 gt_idx,
+                gt_angle,
                 metrics["psnr"],
                 metrics["ssim"],
                 metrics["lpips"],

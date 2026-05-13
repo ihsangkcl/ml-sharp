@@ -10,6 +10,8 @@ click==8.3.0
     # via sharp
 DISTS-pytorch
     # via sharp
+h3ds
+    # via sharp
 lpips
     # via sharp
 colorama==0.4.6 ; sys_platform == 'win32'

@@ -181,3 +181,48 @@ def render_input_view(
         image_height=height,
     )
     return output.color[0].clamp(0.0, 1.0)
+
+
+def render_at_pose(
+    gaussians: Gaussians3D,
+    extrinsics: torch.Tensor,
+    intrinsics_3x3: torch.Tensor,
+    image_height: int,
+    image_width: int,
+    color_space: str = "linearRGB",
+    device: torch.device | str = "default",
+) -> torch.Tensor:
+    """Render gaussians at an arbitrary camera pose.
+
+    Args:
+        gaussians: Predicted 3D gaussians (lives in the input camera's frame).
+        extrinsics: 4x4 world-to-camera matrix (where "world" is the input
+            camera's frame, i.e. identity = the input view).
+        intrinsics_3x3: 3x3 pinhole intrinsics for the target camera, in pixel units.
+        image_height: Output image height.
+        image_width: Output image width.
+        color_space: "linearRGB" or "sRGB"; matches SceneMetaData.color_space.
+        device: Device to run rendering on.
+
+    Returns:
+        Rendered color image, shape (3, H, W), values in [0, 1].
+    """
+    if not isinstance(device, torch.device):
+        device = _resolve_render_device(device)
+
+    extrinsics_pt = extrinsics.to(device=device, dtype=torch.float32)
+    if extrinsics_pt.shape != (4, 4):
+        raise ValueError(f"extrinsics must be 4x4, got {tuple(extrinsics_pt.shape)}.")
+
+    intrinsics_pt = torch.eye(4, device=device, dtype=torch.float32)
+    intrinsics_pt[:3, :3] = intrinsics_3x3.to(device=device, dtype=torch.float32)
+
+    renderer = gsplat.GSplatRenderer(color_space=color_space)
+    output = renderer(
+        gaussians.to(device),
+        extrinsics=extrinsics_pt[None],
+        intrinsics=intrinsics_pt[None],
+        image_width=image_width,
+        image_height=image_height,
+    )
+    return output.color[0].clamp(0.0, 1.0)

@@ -169,3 +169,5 @@ cython_debug/
 input/
 output/
 output_test/
+test_input/
+test_output/
